@@ -12,11 +12,17 @@ import {
 } from "../src/openai-assistants.js";
 import { installRealtimeServer } from "../src/openai-realtime.js";
 import {
+  normalizeOpenAiRequest,
   normalizeAnthropicRequest,
   buildStructuredPrompt,
   parseStructuredEnvelope,
   runGatewaySession,
 } from "../src/session-core.js";
+import { normalizeChatCompletionsRequest } from "../src/openai-chat.js";
+import {
+  attachmentUploadResultToReference,
+  classifyAttemptFailure,
+} from "../src/tabbit-web-bridge.js";
 import {
   normalizeServerToolDefinition,
   executeServerToolUse,
@@ -139,6 +145,13 @@ async function createTempAssistantsRuntime() {
     }),
   };
 }
+
+const tinyPngDataUrl =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+const tinyPdfDataUrl =
+  "data:application/pdf;base64,JVBERi0xLjQKMSAwIG9iago8PC9UeXBlL0NhdGFsb2c+PgplbmRvYmoKJSVFT0Y=";
+const tinyHtmlDataUrl =
+  "data:text/html;base64,PGh0bWw+PGJvZHk+SGVsbG88L2JvZHk+PC9odG1sPg==";
 
 async function collectRealtimeEvents(baseUrl, actions, headers = {}) {
   const wsUrl = `${baseUrl.replace("http://", "ws://")}/v1/realtime?model=tabbit/priority`;
@@ -382,6 +395,7 @@ test("POST /v1/responses preserves OpenAI wire shape", async () => {
     });
 
     assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type"), /charset=utf-8/);
     assert.equal(body.object, "response");
     assert.equal(body.output[0].type, "message");
   } finally {
@@ -426,6 +440,276 @@ test("POST /v1/responses stream emits OpenAI SDK compatible events", async () =>
     assert.equal(eventPayloads[4].logprobs.length, 0);
     assert.equal(eventPayloads.at(-1).type, "response.completed");
     assert.equal(eventPayloads.at(-1).response.status, "completed");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("OpenAI Responses normalizes input_image data URLs as attachments", () => {
+  const normalized = normalizeOpenAiRequest({
+    model: "tabbit/priority",
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "What is in this image?" },
+          { type: "input_image", image_url: tinyPngDataUrl },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(normalized.attachments.length, 1);
+  assert.equal(normalized.attachments[0].kind, "image");
+  assert.equal(normalized.attachments[0].filename, "image.png");
+  assert.equal(normalized.attachments[0].source, "data");
+  assert.equal(normalized.messages[0].content[0].text, "What is in this image?");
+  assert.doesNotMatch(buildStructuredPrompt(normalized), /iVBORw0KGgo/);
+});
+
+test("OpenAI Responses normalizes Hermes image_url object attachments", () => {
+  const normalized = normalizeOpenAiRequest({
+    model: "tabbit/priority",
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text:
+              "Image test\n\n[Image attached at: /home/ttop5/.hermes/cache/images/img_latest.jpg]",
+          },
+          { type: "image_url", image_url: { url: tinyPngDataUrl } },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(normalized.attachments.length, 1);
+  assert.equal(normalized.attachments[0].kind, "image");
+  assert.equal(normalized.attachments[0].source, "data");
+
+  const prompt = buildStructuredPrompt(normalized);
+  assert.doesNotMatch(prompt, /iVBORw0KGgo/);
+  assert.doesNotMatch(prompt, /img_latest\.jpg/);
+  assert.match(prompt, /Attachment is available as a native Tabbit reference/);
+});
+
+test("OpenAI Responses normalizes input_file PDF, HTML, and HTTP URL attachments", () => {
+  const normalized = normalizeOpenAiRequest({
+    model: "tabbit/priority",
+    input: [
+      { type: "input_file", filename: "doc.pdf", file_data: tinyPdfDataUrl },
+      { type: "input_file", filename: "page.html", file_data: tinyHtmlDataUrl },
+      {
+        type: "input_file",
+        filename: "remote.pdf",
+        file_url: "https://example.test/remote.pdf",
+      },
+    ],
+  });
+
+  assert.equal(normalized.attachments.length, 3);
+  assert.deepEqual(
+    normalized.attachments.map((attachment) => attachment.kind),
+    ["document", "document", "document"],
+  );
+  assert.deepEqual(
+    normalized.attachments.map((attachment) => attachment.filename),
+    ["doc.pdf", "page.html", "remote.pdf"],
+  );
+  assert.equal(normalized.attachments[2].source, "url");
+  assert.equal(normalized.messages[0].content[0].text, "Please analyze the attached file(s).");
+});
+
+test("OpenAI Responses preserves role history with native attachments", () => {
+  const normalized = normalizeOpenAiRequest({
+    model: "tabbit/priority",
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "图片测试" },
+          { type: "input_image", image_url: tinyPngDataUrl },
+        ],
+      },
+      {
+        role: "assistant",
+        content:
+          "图片又收到了,但视觉识别这次还是超时了(上游 30s 限制),我这边依然拿不到图像内容描述。\n本地路径:/home/ttop5/.hermes/cache/images/img_old.jpg",
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text:
+              "图片测试\n\n[Image attached at: /home/ttop5/.hermes/cache/images/img_new.jpg]",
+          },
+          { type: "image_url", image_url: tinyPngDataUrl },
+        ],
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    normalized.messages.map((message) => message.role),
+    ["user", "assistant", "user"],
+  );
+  assert.equal(normalized.attachments.length, 2);
+
+  const prompt = buildStructuredPrompt(normalized);
+  assert.doesNotMatch(prompt, /视觉识别这次还是超时/);
+  assert.doesNotMatch(prompt, /img_old\.jpg|img_new\.jpg/);
+  assert.match(prompt, /Previous assistant attachment-analysis failure message ignored/);
+  assert.match(prompt, /Attachment is available as a native Tabbit reference/);
+});
+
+test("OpenAI Responses accepts attachment-only requests", async () => {
+  let capturedRequest;
+  const { server, baseUrl } = await startServer({
+    runGatewaySession: async (normalized) => {
+      capturedRequest = normalized;
+      return {
+        ok: true,
+        contentBlocks: [{ type: "text", text: "image accepted" }],
+        stopReason: "end_turn",
+        selectedModel: "tabbit/priority",
+        attemptedModels: ["tabbit/priority"],
+        fallbackHappened: false,
+        usageEstimate: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      };
+    },
+  });
+  try {
+    const { response, body } = await requestJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer test-key",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "tabbit/priority",
+        input: [{ type: "input_image", image_url: tinyPngDataUrl }],
+      }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(body.output[0].content[0].text, "image accepted");
+    assert.equal(capturedRequest.attachments.length, 1);
+    assert.equal(capturedRequest.attachments[0].kind, "image");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("OpenAI Chat and Anthropic messages preserve image and document attachments", () => {
+  const chat = normalizeChatCompletionsRequest({
+    model: "tabbit/priority",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Compare these." },
+          { type: "image_url", image_url: { url: tinyPngDataUrl } },
+          { type: "input_file", filename: "page.html", file_data: tinyHtmlDataUrl },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(chat.attachments.length, 2);
+  assert.deepEqual(
+    chat.attachments.map((attachment) => attachment.kind),
+    ["image", "document"],
+  );
+  assert.equal(chat.messages[0].content[0].text, "Compare these.");
+
+  const anthropic = normalizeAnthropicRequest({
+    model: "tabbit/priority",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Summarize both." },
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/png",
+              data: tinyPngDataUrl.split(",")[1],
+            },
+          },
+          {
+            type: "document",
+            filename: "paper.pdf",
+            source: {
+              type: "url",
+              url: "https://example.test/paper.pdf",
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(anthropic.attachments.length, 2);
+  assert.deepEqual(
+    anthropic.attachments.map((attachment) => attachment.kind),
+    ["image", "document"],
+  );
+  assert.equal(anthropic.messages[0].content[0].text, "Summarize both.");
+});
+
+test("attachment validation rejects local paths, file_id, unsupported types, and count overflow", async () => {
+  const { server, baseUrl } = await startServer();
+  try {
+    const cases = [
+      {
+        input: [{ type: "input_image", image_url: "file:///C:/tmp/pic.png" }],
+        message: /Local file paths/,
+      },
+      {
+        input: [{ type: "input_file", file_id: "file_123" }],
+        message: /file_id/,
+      },
+      {
+        input: [
+          {
+            type: "input_file",
+            filename: "script.exe",
+            file_data: "data:application/octet-stream;base64,AAAA",
+          },
+        ],
+        message: /Unsupported attachment type/,
+      },
+      {
+        input: Array.from({ length: 6 }, (_, index) => ({
+          type: "input_file",
+          filename: `note-${index}.txt`,
+          file_data: "data:text/plain;base64,aGk=",
+        })),
+        message: /Too many attachments/,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const { response, body } = await requestJson(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "tabbit/priority",
+          input: testCase.input,
+        }),
+      });
+
+      assert.equal(response.status, 400);
+      assert.equal(body.error.type, "invalid_request_error");
+      assert.match(body.error.message, testCase.message);
+    }
   } finally {
     await stopServer(server);
   }
@@ -516,6 +800,59 @@ test("POST /v1/chat/completions rejects missing auth and empty messages", async 
   } finally {
     await stopServer(server);
   }
+});
+
+test("OpenAI routes surface Tabbit upstream availability failures as 503", async () => {
+  const { server, baseUrl } = await startServer({
+    runGatewaySession: async () => ({
+      ok: false,
+      error: "tabbit_error",
+      detail: "Service is busy. Please try again tomorrow.",
+      failure_reason: "upstream_unavailable",
+      requestedModelAlias: "tabbit/priority",
+      attemptedModels: ["tabbit/DeepSeek-V4-Pro"],
+      fallbackHappened: true,
+    }),
+  });
+  try {
+    const { response, body } = await requestJson(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer test-key",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "tabbit/priority",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+
+    assert.equal(response.status, 503);
+    assert.equal(body.error.type, "api_error");
+    assert.match(body.error.message, /Service is busy/);
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("Tabbit limit messages are classified as retryable upstream failures", () => {
+  assert.deepEqual(
+    classifyAttemptFailure({
+      ok: false,
+      error: "tabbit_error",
+      detail: "[492] 欢迎使用 Tabbit 浏览器（https://www.tabbitbrowser.com/），可免费使用最全最先进的模型。",
+    }),
+    { retryable: true, reason: "upstream_unavailable" },
+  );
+
+  assert.deepEqual(
+    classifyAttemptFailure({
+      ok: false,
+      error: "tabbit_error",
+      detail: "Service is busy. Please try again tomorrow.",
+    }),
+    { retryable: true, reason: "upstream_unavailable" },
+  );
 });
 
 test("POST /v1/chat/completions maps client tool calls", async () => {
@@ -935,6 +1272,292 @@ test("parseStructuredEnvelope accepts fenced JSON", () => {
   assert.equal(parsed.contentBlocks[0].type, "tool_use");
 });
 
+test("parseStructuredEnvelope unwraps nested JSON text envelopes", () => {
+  const nested = JSON.stringify({
+    stop_reason: "end_turn",
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "image was read" }],
+        }),
+      },
+    ],
+  });
+
+  const parsed = parseStructuredEnvelope(nested);
+  assert.equal(parsed.stopReason, "end_turn");
+  assert.deepEqual(parsed.contentBlocks, [
+    { type: "text", text: "image was read" },
+  ]);
+});
+
+test("parseStructuredEnvelope accepts escaped dollar signs from Tabbit JSON", () => {
+  const parsed = parseStructuredEnvelope(
+    '{"stop_reason":"end_turn","content":[{"type":"text","text":"Cost is \\$1.00"}]}',
+  );
+
+  assert.equal(parsed.stopReason, "end_turn");
+  assert.deepEqual(parsed.contentBlocks, [
+    { type: "text", text: "Cost is $1.00" },
+  ]);
+});
+
+test("buildStructuredPrompt hides vision_analyze when native attachments exist", () => {
+  const normalized = normalizeOpenAiRequest({
+    model: "tabbit/priority",
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "Describe this image." },
+          { type: "input_image", image_url: tinyPngDataUrl },
+        ],
+      },
+    ],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "vision_analyze",
+          description: "Analyze an image using an auxiliary vision service.",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "other_tool",
+          description: "Another client tool.",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    ],
+  });
+
+  const prompt = buildStructuredPrompt(normalized);
+  assert.doesNotMatch(prompt, /"name": "vision_analyze"/);
+  assert.match(prompt, /"name": "other_tool"/);
+  assert.match(prompt, /Unavailable client tools for this turn/);
+  assert.match(prompt, /native attachment directly/);
+  assert.doesNotMatch(prompt, /Do not call vision_analyze/);
+});
+
+test("buildStructuredPrompt removes Hermes vision helper hints for native attachments", () => {
+  const normalized = normalizeOpenAiRequest({
+    model: "tabbit/priority",
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text:
+              "图片测试\n\n[Image attached at: /home/ttop5/.hermes/cache/images/img_abc.jpg]",
+          },
+          { type: "input_image", image_url: tinyPngDataUrl },
+        ],
+      },
+    ],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "read_file",
+          description:
+            "Read text files. NOTE: Cannot read images or binary files — use vision_analyze for images.",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    ],
+  });
+
+  const prompt = buildStructuredPrompt(normalized);
+  assert.doesNotMatch(prompt, /\/home\/ttop5\/\.hermes\/cache\/images/);
+  assert.doesNotMatch(prompt, /vision_analyze/);
+  assert.match(prompt, /Attachment is available as a native Tabbit reference/);
+  assert.match(prompt, /Native attachments in this turn are already available/);
+});
+
+test("runGatewaySession retries when Tabbit calls disabled vision tool for attachments", async () => {
+  const normalized = normalizeOpenAiRequest({
+    model: "tabbit/priority",
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "Describe this image." },
+          { type: "input_image", image_url: tinyPngDataUrl },
+        ],
+      },
+    ],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "vision_analyze",
+          description: "Analyze an image using an auxiliary vision service.",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    ],
+  });
+  const prompts = [];
+
+  const result = await runGatewaySession(normalized, {
+    sendPromptToTabbit: async ({ prompt }) => {
+      prompts.push(prompt);
+      if (prompts.length === 1) {
+        return {
+          ok: true,
+          text: JSON.stringify({
+            stop_reason: "tool_use",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_vision",
+                name: "vision_analyze",
+                input: { image_url: "/tmp/image.png" },
+              },
+            ],
+          }),
+          gatewayModelId: "tabbit/priority",
+          attemptedModels: ["tabbit/priority"],
+          fallbackHappened: false,
+        };
+      }
+
+      return {
+        ok: true,
+        text: JSON.stringify({
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "I can read the native attachment." }],
+        }),
+        gatewayModelId: "tabbit/priority",
+        attemptedModels: ["tabbit/priority"],
+        fallbackHappened: false,
+      };
+    },
+    executeServerToolUse: async () => {
+      throw new Error("client vision tool must not be executed by the gateway");
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(prompts.length, 2);
+  assert.equal(result.contentBlocks.length, 1);
+  assert.equal(result.contentBlocks[0].type, "text");
+  assert.match(result.contentBlocks[0].text, /native attachment/);
+  assert.match(prompts[1], /unavailable for this turn/);
+});
+
+test("runGatewaySession retries attachment timeout fallback text", async () => {
+  const normalized = normalizeOpenAiRequest({
+    model: "tabbit/priority",
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "图片测试" },
+          { type: "input_image", image_url: tinyPngDataUrl },
+        ],
+      },
+    ],
+  });
+  const prompts = [];
+
+  const result = await runGatewaySession(normalized, {
+    sendPromptToTabbit: async ({ prompt }) => {
+      prompts.push(prompt);
+      if (prompts.length === 1) {
+        return {
+          ok: true,
+          text: JSON.stringify({
+            stop_reason: "end_turn",
+            content: [
+              {
+                type: "text",
+                text:
+                  "图片接收到了,但自动分析超时了(30秒上游限制),所以我这边没拿到图像内容描述。",
+              },
+            ],
+          }),
+          gatewayModelId: "tabbit/priority",
+          attemptedModels: ["tabbit/priority"],
+          fallbackHappened: false,
+        };
+      }
+
+      return {
+        ok: true,
+        text: JSON.stringify({
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "图中是一张仪表盘截图。" }],
+        }),
+        gatewayModelId: "tabbit/priority",
+        attemptedModels: ["tabbit/priority"],
+        fallbackHappened: false,
+      };
+    },
+    executeServerToolUse: async () => {
+      throw new Error("should not execute server tools in this test");
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /previous answer incorrectly claimed/);
+  assert.equal(result.contentBlocks[0].text, "图中是一张仪表盘截图。");
+});
+
+test("runGatewaySession treats disabled vision tool as absent for text fallback", async () => {
+  const normalized = normalizeOpenAiRequest({
+    model: "tabbit/priority",
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "Describe this image." },
+          { type: "input_image", image_url: tinyPngDataUrl },
+        ],
+      },
+    ],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "vision_analyze",
+          description: "Analyze an image using an auxiliary vision service.",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    ],
+  });
+  let calls = 0;
+
+  const result = await runGatewaySession(normalized, {
+    sendPromptToTabbit: async () => {
+      calls += 1;
+      return {
+        ok: true,
+        text: "### Image content\nThe screenshot contains an error message.",
+        gatewayModelId: "tabbit/priority",
+        attemptedModels: ["tabbit/priority"],
+        fallbackHappened: false,
+      };
+    },
+    executeServerToolUse: async () => {
+      throw new Error("should not execute tools in this test");
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.contentBlocks[0].type, "text");
+  assert.match(result.contentBlocks[0].text, /screenshot contains/);
+});
+
 test("runGatewaySession executes server tool loop and returns final text", async () => {
   let calls = 0;
   const normalized = normalizeAnthropicRequest(
@@ -994,6 +1617,146 @@ test("runGatewaySession executes server tool loop and returns final text", async
   assert.equal(result.ok, true);
   assert.equal(result.contentBlocks.at(-1).type, "text");
   assert.equal(result.usageEstimate.server_tool_use.web_search_requests, 1);
+});
+
+test("runGatewaySession repairs Latin-1 decoded UTF-8 text from Tabbit", async () => {
+  const normalized = normalizeOpenAiRequest({
+    model: "tabbit/priority",
+    input: "图片识别",
+  });
+  const mojibakeText = Buffer.from("图片识别成功", "utf8").toString("latin1");
+
+  const result = await runGatewaySession(normalized, {
+    sendPromptToTabbit: async () => ({
+      ok: true,
+      text: JSON.stringify({
+        stop_reason: "end_turn",
+        content: [{ type: "text", text: mojibakeText }],
+      }),
+      gatewayModelId: "tabbit/priority",
+      attemptedModels: ["tabbit/priority"],
+      fallbackHappened: false,
+    }),
+    executeServerToolUse: async () => {
+      throw new Error("should not execute server tools in this test");
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.contentBlocks[0].text, "图片识别成功");
+});
+
+test("runGatewaySession passes attachments through every Tabbit prompt", async () => {
+  const normalized = normalizeAnthropicRequest(
+    {
+      model: "tabbit/priority",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Use the attachment while looping." },
+            {
+              type: "document",
+              filename: "doc.pdf",
+              source: {
+                type: "base64",
+                media_type: "application/pdf",
+                data: tinyPdfDataUrl.split(",")[1],
+              },
+            },
+          ],
+        },
+      ],
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+    },
+    {
+      normalizeModel: (model) => model,
+      normalizeServerTool: normalizeServerToolDefinition,
+    },
+  );
+  const seenAttachmentCounts = [];
+
+  const result = await runGatewaySession(normalized, {
+    sendPromptToTabbit: async ({ attachments }) => {
+      seenAttachmentCounts.push(attachments.length);
+      if (seenAttachmentCounts.length === 1) {
+        return {
+          ok: true,
+          text: JSON.stringify({
+            stop_reason: "tool_use",
+            content: [
+              {
+                type: "server_tool_use",
+                id: "srvtoolu_1",
+                name: "web_search",
+                input: { query: "tabbit2api" },
+              },
+            ],
+          }),
+          gatewayModelId: "tabbit/priority",
+          attemptedModels: ["tabbit/priority"],
+          fallbackHappened: false,
+        };
+      }
+
+      return {
+        ok: true,
+        text: JSON.stringify({
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "done" }],
+        }),
+        gatewayModelId: "tabbit/priority",
+        attemptedModels: ["tabbit/priority"],
+        fallbackHappened: false,
+      };
+    },
+    executeServerToolUse: async () => ({
+      type: "web_search_tool_result",
+      tool_use_id: "srvtoolu_1",
+      is_error: false,
+      content: [{ type: "web_search_result", title: "A", url: "https://a.test" }],
+    }),
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(seenAttachmentCounts, [1, 1]);
+});
+
+test("bridge maps uploaded image and document attachments to Tabbit references", () => {
+  const imageReference = attachmentUploadResultToReference(
+    {
+      kind: "image",
+      filename: "pic.png",
+      sourceUrl: "https://example.test/pic.png",
+    },
+    {
+      success: true,
+      fileId: "file-image",
+      url: "https://cdn.test/pic.png",
+      fileName: "pic.png",
+    },
+  );
+  assert.equal(typeof imageReference.id, "string");
+  assert.equal(imageReference.type, "image");
+  assert.equal(imageReference.title, "pic.png");
+  assert.equal(imageReference.content, "https://cdn.test/pic.png");
+  assert.equal(imageReference.favicon, "");
+  assert.equal(imageReference.path, "file-image");
+  assert.equal(imageReference.sourceUrl, "https://example.test/pic.png");
+
+  const documentReference = attachmentUploadResultToReference(
+    { kind: "document", filename: "paper.pdf" },
+    {
+      success: true,
+      fileId: "file-doc",
+      fileName: "paper.pdf",
+    },
+  );
+  assert.equal(typeof documentReference.id, "string");
+  assert.equal(documentReference.type, "document");
+  assert.equal(documentReference.title, "paper.pdf");
+  assert.equal(documentReference.content, "");
+  assert.equal(documentReference.path, "file-doc");
 });
 
 test("executeServerToolUse handles unsupported tools explicitly", async () => {

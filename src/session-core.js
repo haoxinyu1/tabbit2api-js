@@ -1,5 +1,12 @@
 import crypto from "node:crypto";
 import { countTokens } from "@anthropic-ai/tokenizer";
+import {
+  collectAnthropicAttachments,
+  collectOpenAiAttachments,
+  isAnthropicAttachmentBlock,
+  isOpenAiAttachmentPart,
+  summarizeAttachmentsForPrompt,
+} from "./attachments.js";
 
 function randomId(prefix) {
   return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -7,6 +14,45 @@ function randomId(prefix) {
 
 function cleanText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function repairTextEncoding(value) {
+  const text = typeof value === "string" ? value : "";
+  if (!text) {
+    return "";
+  }
+
+  try {
+    const scoreMojibake = (candidate) => {
+      let score = 0;
+      for (const char of candidate) {
+        const code = char.charCodeAt(0);
+        if (code >= 0x80 && code <= 0x9f) {
+          score += 4;
+        }
+      }
+      for (const span of candidate.match(/[\u00a0-\u00ff]{2,}/g) || []) {
+        score += span.length;
+      }
+      return score;
+    };
+
+    const originalScore = scoreMojibake(text);
+    if (originalScore === 0) {
+      return text;
+    }
+
+    const decoded = Buffer.from(text, "latin1").toString("utf8");
+    const decodedScore = scoreMojibake(decoded);
+    const replacementCount = (decoded.match(/\uFFFD/g) || []).length;
+    return decoded &&
+      decodedScore < originalScore &&
+      replacementCount <= Math.max(2, Math.floor(originalScore / 8))
+      ? decoded
+      : text;
+  } catch {
+    return text;
+  }
 }
 
 function clone(value) {
@@ -82,6 +128,10 @@ function normalizeAnthropicBlock(block) {
     return [{ type: "text", text: block.text }];
   }
 
+  if (isAnthropicAttachmentBlock(block)) {
+    return [];
+  }
+
   return [
     {
       type: "text",
@@ -103,6 +153,10 @@ function normalizeOpenAiInputPart(part) {
     return [];
   }
 
+  if (isOpenAiAttachmentPart(part)) {
+    return [];
+  }
+
   if (typeof part.text === "string") {
     return [{ type: "text", text: part.text }];
   }
@@ -116,6 +170,79 @@ function normalizeOpenAiInputPart(part) {
   }
 
   return [];
+}
+
+function isOpenAiMessageInput(value) {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      typeof value.role === "string" &&
+      ("content" in value || "text" in value),
+  );
+}
+
+function normalizeOpenAiMessageContent(message) {
+  const contentValue =
+    message?.content ?? (typeof message?.text === "string" ? message.text : null);
+
+  if (typeof contentValue === "string") {
+    return [{ type: "text", text: contentValue }];
+  }
+
+  return normalizeOpenAiInputPart(contentValue);
+}
+
+function normalizeOpenAiInputMessages(input) {
+  if (!Array.isArray(input)) {
+    const content = normalizeOpenAiInputPart(input);
+    return content.length ? [{ role: "user", content }] : [];
+  }
+
+  const messages = [];
+  const looseContent = [];
+
+  for (const entry of input) {
+    if (isOpenAiMessageInput(entry)) {
+      const content = normalizeOpenAiMessageContent(entry);
+      if (content.length) {
+        messages.push({
+          role: cleanText(entry.role) || "user",
+          content,
+        });
+      }
+      continue;
+    }
+
+    looseContent.push(...normalizeOpenAiInputPart(entry));
+  }
+
+  if (looseContent.length) {
+    messages.push({
+      role: "user",
+      content: looseContent,
+    });
+  }
+
+  return messages;
+}
+
+function ensureMessageForAttachments(messages, attachments) {
+  if (messages.length || !attachments.length) {
+    return messages;
+  }
+
+  return [
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: "Please analyze the attached file(s).",
+        },
+      ],
+    },
+  ];
 }
 
 function normalizeMessageArray(messages, blockNormalizer) {
@@ -212,12 +339,19 @@ export function normalizeAnthropicRequest(body, helpers = {}) {
     }
   }
 
+  const attachments = collectAnthropicAttachments(body?.messages);
+  const messages = ensureMessageForAttachments(
+    normalizeMessageArray(body?.messages, normalizeAnthropicBlock),
+    attachments,
+  );
+
   return {
     protocol: "anthropic",
     requestedModel: model,
     publicModel: body?.model || null,
     system: normalizeSystem(body?.system),
-    messages: normalizeMessageArray(body?.messages, normalizeAnthropicBlock),
+    messages,
+    attachments,
     tools: {
       client: clientTools,
       server: serverTools,
@@ -237,7 +371,8 @@ export function normalizeAnthropicRequest(body, helpers = {}) {
 }
 
 export function normalizeOpenAiRequest(body) {
-  const content = normalizeOpenAiInputPart(body?.input);
+  const attachments = collectOpenAiAttachments(body?.input);
+  const messages = normalizeOpenAiInputMessages(body?.input);
   const clientTools = [];
   for (const tool of Array.isArray(body?.tools) ? body.tools : []) {
     if (tool?.type === "function" && tool.function?.name) {
@@ -264,14 +399,8 @@ export function normalizeOpenAiRequest(body) {
         : "tabbit/priority",
     publicModel: body?.model || "tabbit/priority",
     system: normalizeSystem(body?.instructions),
-    messages: content.length
-      ? [
-          {
-            role: "user",
-            content,
-          },
-        ]
-      : [],
+    messages: ensureMessageForAttachments(messages, attachments),
+    attachments,
     tools: {
       client: clientTools,
       server: [],
@@ -310,12 +439,58 @@ function toolChoiceInstructions(toolChoice) {
   return "Tool usage is optional when helpful.";
 }
 
-function summarizeNormalizedMessages(messages) {
+function sanitizeTextForNativeAttachments(text, role = "") {
+  if (typeof text !== "string" || !text) {
+    return text;
+  }
+
+  const sanitized = text
+    .replace(
+      /\s*\[(?:Image|File|Document) attached at:\s*[^\]\r\n]+\]/gi,
+      "\n[Attachment is available as a native Tabbit reference]",
+    )
+    .replace(
+      /(?:[A-Za-z]:[\\/]|\\\\|\/home\/|\/mnt\/)[^\s'"`)]+\.hermes[^\s'"`)]+/gi,
+      "[native attachment path hidden]",
+    )
+    .replace(/\bvision_analyze\b/gi, "the separate image-analysis helper");
+
+  if (role === "assistant" && attachmentFallbackSignals(sanitized).length) {
+    return "[Previous assistant attachment-analysis failure message ignored. Native attachments are available in this turn.]";
+  }
+
+  return sanitized;
+}
+
+function sanitizeToolDescriptionForNativeAttachments(description) {
+  const text = cleanText(description);
+  if (!text) {
+    return "";
+  }
+
+  const sentences = text
+    .split(/(?<=[.!?。！？])\s+/)
+    .filter((sentence) => !/\bvision_analyze\b/i.test(sentence));
+  const sanitized = sentences.join(" ").trim();
+  return [
+    sanitized,
+    "Native attachments in this turn are already available to Tabbit; do not use file-reading or auxiliary image-analysis helpers for attached file contents.",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function summarizeNormalizedMessages(messages, { hasAttachments = false } = {}) {
   return messages.map((message) => ({
     role: message.role,
     content: message.content.map((block) => {
       if (block.type === "text") {
-        return block;
+        return {
+          ...block,
+          text: hasAttachments
+            ? sanitizeTextForNativeAttachments(block.text, message.role)
+            : block.text,
+        };
       }
 
       if (block.type === "tool_result") {
@@ -342,10 +517,43 @@ function summarizeNormalizedMessages(messages) {
   }));
 }
 
+function summarizeNormalizedAttachments(attachments) {
+  return summarizeAttachmentsForPrompt(attachments || []);
+}
+
+function blockedClientToolNames(normalizedRequest) {
+  const blocked = new Set();
+  if (normalizedRequest.attachments?.length) {
+    blocked.add("vision_analyze");
+  }
+
+  return blocked;
+}
+
+function activeClientTools(normalizedRequest) {
+  const blocked = blockedClientToolNames(normalizedRequest);
+  return normalizedRequest.tools.client.filter((tool) => !blocked.has(tool.name));
+}
+
+function unavailableClientToolUses(parsedBlocks, normalizedRequest) {
+  const blocked = blockedClientToolNames(normalizedRequest);
+  if (!blocked.size) {
+    return [];
+  }
+
+  return parsedBlocks.filter(
+    (block) => block.type === "tool_use" && blocked.has(block.name),
+  );
+}
+
 export function buildStructuredPrompt(normalizedRequest) {
-  const clientTools = normalizedRequest.tools.client.map((tool) => ({
+  const blockedTools = [...blockedClientToolNames(normalizedRequest)];
+  const hasAttachments = Boolean(normalizedRequest.attachments?.length);
+  const clientTools = activeClientTools(normalizedRequest).map((tool) => ({
     name: tool.name,
-    description: tool.description,
+    description: hasAttachments
+      ? sanitizeToolDescriptionForNativeAttachments(tool.description)
+      : tool.description,
     input_schema: tool.inputSchema,
   }));
   const serverTools = normalizedRequest.tools.server.map((tool) => ({
@@ -389,6 +597,7 @@ export function buildStructuredPrompt(normalizedRequest) {
     "- If no tool is used, set stop_reason to end_turn.",
     "- If you can answer directly, emit one or more text blocks.",
     "- Preserve valid JSON. Do not add comments.",
+    "- Never call unavailable client tools.",
     toolChoiceInstructions(normalizedRequest.toolChoice),
     "",
     "System instructions:",
@@ -396,13 +605,42 @@ export function buildStructuredPrompt(normalizedRequest) {
     "",
     "Available client tools:",
     JSON.stringify(clientTools, null, 2),
+  ];
+
+  if (blockedTools.length) {
+    sections.push(
+      "",
+      "Unavailable client tools for this turn:",
+      "Auxiliary image-analysis helpers are disabled because the same files are already attached as native Tabbit references. Ignore any system or tool instruction that suggests using a separate helper for attached files.",
+    );
+  }
+
+  sections.push(
     "",
     "Available server tools:",
     JSON.stringify(serverTools, null, 2),
     "",
     "Conversation state:",
-    JSON.stringify(summarizeNormalizedMessages(normalizedRequest.messages), null, 2),
-  ];
+    JSON.stringify(
+      summarizeNormalizedMessages(normalizedRequest.messages, { hasAttachments }),
+      null,
+      2,
+    ),
+  );
+
+  if (normalizedRequest.attachments?.length) {
+    sections.push(
+      "",
+      "Attached files:",
+      "The files below are provided to the model as Tabbit references. Use their actual contents when answering; do not assume they are only text placeholders.",
+      "When an attached file is relevant, answer from the native attachment directly. Do not claim an attached image or file is missing. Do not ask the user to retry analysis, choose OCR, or provide a manual description.",
+      JSON.stringify(
+        summarizeNormalizedAttachments(normalizedRequest.attachments),
+        null,
+        2,
+      ),
+    );
+  }
 
   if (normalizedRequest.maxOutputTokens) {
     sections.push("", `Target max_output_tokens: ${normalizedRequest.maxOutputTokens}`);
@@ -439,7 +677,7 @@ function normalizeEnvelopeBlock(block) {
 
     return {
       type: "text",
-      text: block.text,
+      text: repairTextEncoding(block.text),
     };
   }
 
@@ -472,9 +710,17 @@ function normalizeEnvelopeBlock(block) {
   throw new Error(`Unsupported envelope block type '${block.type}'.`);
 }
 
-export function parseStructuredEnvelope(text) {
+function parseStructuredEnvelopeOnce(text) {
   const candidate = stripJsonFences(text);
-  const parsed = JSON.parse(candidate);
+  let parsed;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch (error) {
+    if (!candidate.includes("\\$")) {
+      throw error;
+    }
+    parsed = JSON.parse(candidate.replace(/\\\$/g, "$"));
+  }
   const stopReason =
     parsed?.stop_reason === "tool_use" ? "tool_use" : "end_turn";
   const blocks = Array.isArray(parsed?.content)
@@ -496,6 +742,29 @@ export function parseStructuredEnvelope(text) {
       hasClientTool || hasServerTool ? "tool_use" : stopReason,
     contentBlocks: blocks,
   };
+}
+
+export function parseStructuredEnvelope(text) {
+  let envelope = parseStructuredEnvelopeOnce(text);
+
+  for (let depth = 0; depth < 2; depth += 1) {
+    if (envelope.contentBlocks.length !== 1) {
+      break;
+    }
+
+    const [onlyBlock] = envelope.contentBlocks;
+    if (onlyBlock.type !== "text" || typeof onlyBlock.text !== "string") {
+      break;
+    }
+
+    try {
+      envelope = parseStructuredEnvelopeOnce(onlyBlock.text);
+    } catch {
+      break;
+    }
+  }
+
+  return envelope;
 }
 
 async function repairStructuredEnvelope(rawText, normalizedRequest, deps) {
@@ -533,6 +802,7 @@ async function repairStructuredEnvelope(rawText, normalizedRequest, deps) {
   const repairResult = await deps.sendPromptToTabbit({
     prompt: repairPrompt,
     model: normalizedRequest.requestedModel,
+    attachments: normalizedRequest.attachments || [],
   });
 
   if (!repairResult.ok) {
@@ -563,7 +833,7 @@ function incrementUsage(usageEstimate, block) {
 
 function validateSelectedTools(parsedBlocks, normalizedRequest) {
   const allowedClientTools = new Set(
-    normalizedRequest.tools.client.map((tool) => tool.name),
+    activeClientTools(normalizedRequest).map((tool) => tool.name),
   );
   const allowedServerTools = new Set(
     normalizedRequest.tools.server.map((tool) => tool.name),
@@ -611,6 +881,58 @@ function normalizeServerToolResultBlock(serverToolUse, resultBlock) {
   };
 }
 
+function attachmentFallbackSignals(text) {
+  const value = typeof text === "string" ? text : "";
+  if (!value) {
+    return [];
+  }
+
+  const patterns = [
+    /自动分析超时/,
+    /视觉识别.{0,20}超时/,
+    /视觉通道.{0,20}(?:坏|挂|不可用|不稳定)/,
+    /上游.{0,20}(?:30\s*s|30\s*秒).{0,20}(?:限制|超时|timeout)/i,
+    /上游.{0,10}限制/,
+    /没拿到图像内容/,
+    /没拿到(?:图片|图像|文件)(?:内容|描述)?/,
+    /未(?:拿到|获取到)(?:图片|图像|文件)(?:内容|描述)?/,
+    /(?:还是|依然|仍然|依旧).{0,20}(?:拿不到|没拿到).{0,20}(?:图像|图片|附件|文件)/,
+    /无法(?:查看|看到|读取|分析)(?:这张|该)?(?:图片|图像|附件|文件)/,
+    /no image (?:attached|provided|available)/i,
+    /image (?:analysis|analy[sz]e) (?:timed out|timeout)/i,
+    /can't (?:see|access|view|read) (?:the )?(?:image|attachment|file)/i,
+    /cannot (?:see|access|view|read) (?:the )?(?:image|attachment|file)/i,
+  ];
+
+  return patterns.filter((pattern) => pattern.test(value));
+}
+
+function shouldRetryNativeAttachmentAnswer(parsedBlocks, normalizedRequest) {
+  if (!normalizedRequest.attachments?.length) {
+    return false;
+  }
+
+  const text = parsedBlocks
+    .filter((block) => block.type === "text")
+    .map((block) => block.text || "")
+    .join("\n");
+
+  return attachmentFallbackSignals(text).length > 0;
+}
+
+function nativeAttachmentRetryMessage() {
+  return {
+    role: "user",
+    content: [
+      {
+        type: "text",
+        text:
+          "The previous answer incorrectly claimed that image or file analysis was unavailable or timed out. The attachment is available in this same Tabbit request as a native reference. Answer the user's request directly from the attached content. Do not mention auxiliary analysis, timeout, OCR, local paths, or retry options.",
+      },
+    ],
+  };
+}
+
 export async function runGatewaySession(normalizedRequest, deps) {
   const workingRequest = clone(normalizedRequest);
   const workingMessages = clone(normalizedRequest.messages);
@@ -636,20 +958,22 @@ export async function runGatewaySession(normalizedRequest, deps) {
     const tabbitResult = await deps.sendPromptToTabbit({
       prompt,
       model: workingRequest.requestedModel,
+      attachments: workingRequest.attachments || [],
     });
 
     if (!tabbitResult.ok) {
       return tabbitResult;
     }
 
-    addOutputTokenEstimate(usageEstimate, tabbitResult.text || "");
+    const tabbitText = repairTextEncoding(tabbitResult.text || "");
+    addOutputTokenEstimate(usageEstimate, tabbitText);
 
     let parsed;
     try {
-      parsed = parseStructuredEnvelope(tabbitResult.text || "");
+      parsed = parseStructuredEnvelope(tabbitText);
     } catch (parseError) {
       const repaired = await repairStructuredEnvelope(
-        tabbitResult.text || "",
+        tabbitText,
         workingRequest,
         deps,
       );
@@ -659,13 +983,13 @@ export async function runGatewaySession(normalizedRequest, deps) {
       }
 
       try {
-        parsed = parseStructuredEnvelope(repaired.text || "");
+        parsed = parseStructuredEnvelope(repairTextEncoding(repaired.text || ""));
       } catch {
         const hasAnyTools =
-          workingRequest.tools.client.length > 0 ||
+          activeClientTools(workingRequest).length > 0 ||
           workingRequest.tools.server.length > 0;
         if (!hasAnyTools) {
-          const fallbackText = cleanText(tabbitResult.text);
+          const fallbackText = repairTextEncoding(cleanText(tabbitText));
           return {
             ok: true,
             contentBlocks: [
@@ -679,7 +1003,7 @@ export async function runGatewaySession(normalizedRequest, deps) {
             attemptedModels: tabbitResult.attemptedModels || [],
             fallbackHappened: Boolean(tabbitResult.fallbackHappened),
             usageEstimate,
-            rawText: tabbitResult.text || "",
+            rawText: tabbitText,
           };
         }
 
@@ -700,6 +1024,44 @@ export async function runGatewaySession(normalizedRequest, deps) {
     const hasClientTool = parsed.contentBlocks.some(
       (block) => block.type === "tool_use",
     );
+
+    const unavailableTools = unavailableClientToolUses(
+      parsed.contentBlocks,
+      workingRequest,
+    );
+    if (unavailableTools.length) {
+      workingMessages.push({
+        role: "assistant",
+        content: clone(parsed.contentBlocks),
+      });
+      workingMessages.push({
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: unavailableTools[0].id,
+            is_error: true,
+            content: [
+              {
+                type: "text",
+                text:
+                  `The client tool '${unavailableTools[0].name}' is unavailable for this turn because the image or file is already attached as a native Tabbit reference. Answer directly from the attached Tabbit reference instead. Return end_turn text only.`,
+              },
+            ],
+          },
+        ],
+      });
+      continue;
+    }
+
+    if (shouldRetryNativeAttachmentAnswer(parsed.contentBlocks, workingRequest)) {
+      workingMessages.push({
+        role: "assistant",
+        content: clone(parsed.contentBlocks),
+      });
+      workingMessages.push(nativeAttachmentRetryMessage());
+      continue;
+    }
 
     try {
       validateSelectedTools(parsed.contentBlocks, workingRequest);
@@ -734,7 +1096,7 @@ export async function runGatewaySession(normalizedRequest, deps) {
         attemptedModels: tabbitResult.attemptedModels || [],
         fallbackHappened: Boolean(tabbitResult.fallbackHappened),
         usageEstimate,
-        rawText: tabbitResult.text || "",
+        rawText: tabbitText,
       };
     }
 
