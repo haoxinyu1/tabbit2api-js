@@ -47,9 +47,6 @@ test("package metadata exposes the npm CLI and publish whitelist", async () => {
     "examples/codex/config.toml.example",
     "examples/claude-code/env.powershell.example",
     "examples/claude-code/env.sh.example",
-    "examples/openclaw/env.powershell.example",
-    "examples/openclaw/env.sh.example",
-    "examples/hermes/config.yaml.example",
   ];
 
   for (const file of [...docFiles, ...exampleFiles]) {

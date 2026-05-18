@@ -3,10 +3,10 @@
 ## 默认本地网关
 
 ```text
-OpenAI Responses base URL: http://127.0.0.1:50124/v1
-Anthropic Messages base URL: http://127.0.0.1:50124
-API key: sk-tabbit-local
-Model: tabbit/priority
+OpenAI Responses 基础地址: http://127.0.0.1:50124/v1
+Anthropic Messages 基础地址: http://127.0.0.1:50124
+API 密钥: sk-tabbit-local
+模型名: tabbit/priority
 ```
 
 开始前先启动本地网关：
@@ -17,21 +17,21 @@ tabbit2api start
 
 如果你还没有 runtime profile，直接运行 `tabbit2api` 也可以，它会自动拉起登录并等待完成。
 
-## Codex
+## Codex 接入
 
 示例文件：
 
 - [../examples/codex/config.toml.example](../examples/codex/config.toml.example)
 
-Codex 使用 OpenAI Responses 兼容面：
+Codex 使用 OpenAI Responses 兼容接口：
 
 ```text
-Base URL: http://127.0.0.1:50124/v1
-API key env: TABBIT_API_KEY
-Model: tabbit/priority
+基础地址: http://127.0.0.1:50124/v1
+API 密钥环境变量: TABBIT_API_KEY
+模型名: tabbit/priority
 ```
 
-## Claude Code
+## Claude Code 接入
 
 示例文件：
 
@@ -41,38 +41,29 @@ Model: tabbit/priority
 Claude Code 使用 Anthropic 风格接口：
 
 ```text
-Base URL: http://127.0.0.1:50124
-API key: sk-tabbit-local
-Model: tabbit/priority
+基础地址: http://127.0.0.1:50124
+API 密钥: sk-tabbit-local
+模型名: tabbit/priority
 ```
 
 注意：这里不要带 `/v1`。
 
-## OpenClaw
-
-示例文件：
-
-- [../examples/openclaw/env.powershell.example](../examples/openclaw/env.powershell.example)
-- [../examples/openclaw/env.sh.example](../examples/openclaw/env.sh.example)
+## OpenClaw 接入
 
 OpenClaw 也走 Anthropic 风格接口，因此同样使用：
 
 ```text
-Base URL: http://127.0.0.1:50124
+基础地址: http://127.0.0.1:50124
 ```
 
-## Hermes Agent
+## Hermes Agent 接入
 
-示例文件：
-
-- [../examples/hermes/config.yaml.example](../examples/hermes/config.yaml.example)
-
-Hermes Agent 使用 OpenAI Responses 兼容面：
+Hermes Agent 使用 OpenAI Responses 兼容接口：
 
 ```text
-Base URL: http://127.0.0.1:50124/v1
-API mode: codex_responses
-Model: tabbit/priority
+基础地址: http://127.0.0.1:50124/v1
+API 模式: codex_responses
+模型名: tabbit/priority
 ```
 
 ## 常见差异

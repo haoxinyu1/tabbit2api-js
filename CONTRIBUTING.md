@@ -1,10 +1,10 @@
-# Contributing to Tabbit2API
+# 参与贡献
 
-## Commit Messages
+## 提交信息
 
-This project uses [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/).
+本项目使用 [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/)。
 
-Accepted examples:
+可接受的示例：
 
 ```text
 feat: add priority route alias
@@ -13,7 +13,7 @@ docs: rewrite public readme
 chore: initialize tabbit2api open source project
 ```
 
-Recommended types:
+推荐类型：
 
 - `feat`
 - `fix`
@@ -24,17 +24,17 @@ Recommended types:
 - `build`
 - `ci`
 
-Local commits are validated through `commitlint` and `husky`.
+本地提交会经过 `commitlint` 和 `husky` 校验。
 
-Install local hooks manually:
+手动安装本地 hooks：
 
 ```powershell
 npm run hooks:install
 ```
 
-This step is only for contributors. End users installing from npm or `npx` should not run it.
+这一步只面向贡献者。通过 npm 或 `npx` 安装的最终用户不需要执行。
 
-## Local Development
+## 本地开发
 
 ```powershell
 npm install
@@ -43,10 +43,10 @@ tabbit2api doctor
 tabbit2api
 ```
 
-## Notes
+## 说明
 
-- Do not commit `.lab*` runtime profiles.
-- Do not commit `node_modules/` or `output/`.
-- Runtime state now defaults to a user-level data directory instead of the repo root.
-- The published package intentionally keeps the existing CLI shape: `start`, `doctor`, `login`, and `probe`.
-- The current public compatibility surface includes Responses, Chat Completions, Assistants, Realtime text, and Anthropic Messages.
+- 不要提交 `.lab*` 运行时 profile。
+- 不要提交 `node_modules/` 或 `output/`。
+- 运行态数据默认放在用户级目录，而不是仓库根目录。
+- 已发布包会刻意保持现有 CLI 形态：`start`、`doctor`、`login`、`probe`。
+- 当前公开兼容面包括 Responses、Chat Completions、Assistants、文本版 Realtime，以及 Anthropic Messages。

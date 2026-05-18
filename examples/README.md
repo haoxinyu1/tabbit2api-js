@@ -1,45 +1,39 @@
-# Tabbit2API examples
+# Tabbit2API 示例配置
 
-These examples assume you already have a local Tabbit2API gateway running.
+这些示例默认你已经在本机启动了 Tabbit2API 网关。
 
-Start it with either:
+可以使用下面任一方式启动：
 
 ```powershell
 tabbit2api
 ```
 
-or:
+或者：
 
 ```powershell
 tabbit2api start
 ```
 
-Default local values:
+默认本地参数：
 
 ```text
-OpenAI Responses base URL: http://127.0.0.1:50124/v1
-Anthropic Messages base URL: http://127.0.0.1:50124
-API key: sk-tabbit-local
-Model: tabbit/priority
+OpenAI Responses 基础地址: http://127.0.0.1:50124/v1
+Anthropic Messages 基础地址: http://127.0.0.1:50124
+API 密钥: sk-tabbit-local
+模型名: tabbit/priority
 ```
 
-## Which base URL to use
+## 基础地址如何选择
 
-- Codex and Hermes Agent: use `http://127.0.0.1:50124/v1`
-- Claude Code and OpenClaw: use `http://127.0.0.1:50124`
+- Codex 和 Hermes Agent：使用 `http://127.0.0.1:50124/v1`
+- Claude Code 和 OpenClaw：使用 `http://127.0.0.1:50124`
 
-## Clients
+## 客户端
 
 - `codex/config.toml.example`
-  - Codex Desktop / Codex CLI provider snippet
-  - Uses OpenAI Responses at `http://127.0.0.1:50124/v1`
+  - Codex Desktop / Codex CLI 提供方配置片段
+  - 使用 `http://127.0.0.1:50124/v1` 上的 OpenAI Responses 兼容接口
 - `claude-code/env.powershell.example`
-  - Claude Code environment variables for Windows PowerShell
+  - Claude Code 的 Windows PowerShell 环境变量示例
 - `claude-code/env.sh.example`
-  - Claude Code environment variables for POSIX shells
-- `openclaw/env.powershell.example`
-  - OpenClaw environment variables for Windows PowerShell
-- `openclaw/env.sh.example`
-  - OpenClaw environment variables for POSIX shells
-- `hermes/config.yaml.example`
-  - Hermes Agent config example
+  - Claude Code 的 POSIX shell 环境变量示例

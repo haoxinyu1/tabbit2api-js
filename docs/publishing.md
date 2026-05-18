@@ -15,13 +15,13 @@ tabbit2api
 
 ## 发布前准备
 
-本机若默认使用镜像 registry，发布时必须显式使用 npm 官方：
+如果本机默认使用镜像 registry，发布时必须显式指定 npm 官方源：
 
 ```powershell
 npm login --registry=https://registry.npmjs.org
 ```
 
-检查当前发布名是否存在：
+检查当前包名是否已经存在：
 
 ```powershell
 npm view tabbit2api --registry=https://registry.npmjs.org
@@ -41,7 +41,7 @@ npm test
 npm pack --dry-run --json --registry=https://registry.npmjs.org
 ```
 
-验证 tarball 的 `npx` / `npm exec` 路径：
+验证 tarball 的 `npx` / `npm exec` 调用路径：
 
 ```powershell
 npm pack --registry=https://registry.npmjs.org

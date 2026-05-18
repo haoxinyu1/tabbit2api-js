@@ -8,7 +8,7 @@ Tabbit2API 对外暴露的是本地兼容层，不是 Tabbit 官方 API。默认
 http://127.0.0.1:50124
 ```
 
-默认本地占位 API key：
+默认本地占位 API 密钥：
 
 ```text
 sk-tabbit-local
@@ -108,7 +108,7 @@ GET /v1/models/tabbit%2Fpriority
 - 支持工具调用的结构化来回传递
 - 仍使用 `tabbit/priority` 作为统一模型入口
 
-## Assistants / Threads / Runs
+## Assistants / Threads / Runs 兼容层
 
 提供本地文本版 Assistants 工作流兼容层，状态默认保存在用户级 runtime 目录：
 
