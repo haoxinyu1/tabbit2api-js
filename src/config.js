@@ -100,9 +100,9 @@ export const OPENAI_ASSISTANTS_STATE_PATH =
   path.join(LAB_ROOT, "openai-assistants-state.json");
 export const OUTPUT_DIR =
   process.env.TABBIT_OUTPUT_DIR || path.join(LAB_ROOT, "output", "playwright");
-export const TABBIT_CHAT_URL = "https://web.tabbitbrowser.com/chat/new";
+export const TABBIT_CHAT_URL = "https://web.tabbit.ai/chat/new";
 export const TABBIT_MODELS_URL =
-  "https://web.tabbitbrowser.com/proxy/v1/model_config/models?a=0";
+  "https://web.tabbit.ai/proxy/v1/model_config/models?a=0";
 
 export const MAXAI_EXTENSION_ID = "mhnlakgilnojmhinhkckjpncpbhabphi";
 export const CHATGPTBOX_EXTENSION_ID = "eobbhoofkanlmddnplfhnmkfbnlhpbbo";

@@ -559,8 +559,8 @@ async function sendUsingPageModule(
       }
 
       const runtime = captureWebpackRequire();
-      const sendMessage = runtime(51523)._;
-      const modes = runtime(96164).R7;
+      const sendMessage = runtime(51523)._z;
+      const modes = runtime(32386).R7;
 
       const state = {
         messages: [],
